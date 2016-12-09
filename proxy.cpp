@@ -16,6 +16,7 @@
 #include <math.h>
 #include <queue>
 #include <pthread.h>
+#include <dirent.h>
 
 //C++
 #include <iostream>
@@ -38,8 +39,15 @@ string homeDir;
 bool caughtSigInt;
 int sock_fd;
 int port;
+FILE* logStream;
+std::string logName;
+struct sockaddr_in servSock, client;
+#define NUMTAGS 6
+std::string tags[NUMTAGS];// = {"id","pw","flag", "file","segment", "msg"}
 
 pthread_mutex_t q_lock;
+pthread_mutex_t client_sock_lock;
+pthread_mutex_t dir_lock;
 queue<Ele*> q;
 int threadsActive;
 vector<string> indexes;
@@ -48,180 +56,74 @@ vector<string> indexes;
     Why are sockaddr_in structs created like that then cast to sockaddr structs?
 */
 
-typedef struct Header{
-    string version;
-    string resp_code;
-    string resp_human;
-    string header1;
-    string val1;
-    string header2;
-    string val2;
-    string header3;
-    string val3;
-}Header;
-
 typedef struct Entry{
     string data;
     int len;
 }Entry;
 
-void catch_sigint(int s){
-    cout<<"caught signal "<<s<<", exiting"<<endl;
-    caughtSigInt = true;
-    for(int i=0; i<10; i++)  {
-        pthread_join(senderThreads[i], NULL);
-        threadsActive--;
+typedef struct Field{
+  std::string name;
+  std::string value;
+}Field;
+
+std::vector<Field> fields;
+
+int parse_request(string msg){
+  std::istringstream msgStream;
+  std::string line;
+
+  //Ignore first line, it's already been checked by check_line_one()
+  getline(msgStream, line);
+
+  while(getline(msgStream, line) != NULL) {
+      std::cout<<"\tLine is "<<line<<std::endl;
+      Field f;
+      char* pch;
+      int idx = 0;
+      char* lineArr = strdup(line.c_str());
+      pch = strtok (lineArr,":");
+      do {
+        std::string tokStr = pch;
+        if(!idx) {
+          f.name = tokStr;
+        } else {
+          f.value = tokStr;
+          fields.push_back(f);
+        }
+        idx++;
+      }while ((pch = strtok(NULL, " :"))!= NULL);
     }
-    pthread_mutex_destroy(&q_lock);
-    close(sock_fd);
-    while(!q.empty()){
-        cout<<"Stuff left in queue?"<<endl;
-        Ele* ele = q.front();
-        q.pop();
-        delete(ele);
-    }
-    //cout<<"afsfsafsaff"<<endl;
-    //exit(0);
+  return 0;
 }
 
-void set_home_dir(){
-    ifstream conf;
-    bool foundExt = false;
-    conf.open("ws.conf");
-    if (!conf.good()) {
-        perror("No configuration file found");
-        printf("Fatal error: exiting.\n");
-        exit(1);
-    }
-
-    while (!conf.eof()) {
-        char buf[MAX_CHARS_PER_LINE];
-        conf.getline(buf, MAX_CHARS_PER_LINE);
-        int n = 0;
-        const char* token[MAX_TOKENS_PER_LINE] = {}; // initialize to 0
-
-        // parse the line
-        //strtok returns 0 (NULL?) if it can't find a token
-        token[0] = strtok(buf, DELIMITER);
-        int numTokens;
-        if (token[0]) {
-            for (n = 1; n < MAX_TOKENS_PER_LINE; n++) {
-                token[n] = strtok(0, DELIMITER);
-                if (!token[n]) {
-                    numTokens = n-1;
-                    break; // no more tokens
-                }
-            }
-        }
-        string word0(token[0]);
-        if(word0 == "DocumentRoot"){
-            int n;
-            char* realDir = new char[strlen(token[1])-2];
-            for(n = 1; n < strlen(token[1])-1; n++) {
-                realDir[n-1]=token[1][n];
-            }
-            string realRealDir(realDir);
-            homeDir = realRealDir;
-        }
-        if(word0 == "Listen") {
-            stringstream strVal;
-            strVal<<token[1];
-            strVal>>port;
-            cout<<"Port is: "<<port<<endl;
-        }
-        if(word0 == "DirectoryIndex") {
-            for(int i = 1; i < numTokens; i++) {
-                string idx(token[i]);
-                indexes.push_back(idx);
-            }
-            for(int i = 0; i < indexes.size(); i++) {
-                cout<<"Indexes["<<i<<"] is "<<indexes[i]<<endl;
-            }
-        }
-    }
-}
-
-//Credit for a lot of this parsing code goes to http://cs.dvc.edu/HowTo_Cparse.html
-int getType(string ext, Entry* type) {
-    ifstream conf;
-    bool foundExt = false;
-    conf.open("ws.conf");
-    if (!conf.good()) {
-        perror("No configuration file found");
-        printf("Fatal error: exiting.\n");
-        exit(1);
-    }
-
-    while (!conf.eof()) {
-        char buf[MAX_CHARS_PER_LINE];
-        conf.getline(buf, MAX_CHARS_PER_LINE);
-        int n = 0;
-        const char* token[MAX_TOKENS_PER_LINE] = {}; // initialize to 0
-
-        // parse the line
-        //strtok returns 0 (NULL?) if it can't find a token
-        token[0] = strtok(buf, DELIMITER);
-        if (token[0]) {
-            for (n = 1; n < MAX_TOKENS_PER_LINE; n++) {
-                token[n] = strtok(0, DELIMITER);
-                if (!token[n]) break; // no more tokens
-            }
-        }
-        if(token[0] && token[1]) {
-            string tok0(token[0]);
-            string tok1(token[1]);
-            if(tok0 == ext) {
-                //string tok1(token[1]);
-                (type->data).assign(tok1);
-                type->len = strlen(token[1]);
-                return 0;
-            }
-        }
-    }
-    return -1;
-}
-
-void pack_header(Header* header, string ext, int* errCode) {
-    cout<<"Entering pack_header"<<endl;
-    string c_type = "Content-Type";
-    string c_len = "Content-Length";
-    string conn = "Connection";
-    header->header1 = "Content-Type";
-    header->header2 = "Content-Length";
-    header->header3 = "Connection";
-    Entry* type = new Entry;
-    type->data = "error";
-    getType(ext, type);
-    if(type->data == "error") cout<<"Error: content type not found"<<endl;
-    header->val1 = type->data;
-    header->val2 = "2"; //gets overwritten
-    header->val3 = "Close";
-    header->resp_code = "200";
+string pack_header(int errCode, bool invalidMethod, bool invalidVersion) {
+    string all;
+    string resp_human;
     switch(*errCode) {
         case 200:
-            header->resp_human = "OK";
+            resp_human = "OK";
             break;
         case 400:
-            header->resp_human = "Bad Request";
+            resp_human = "Bad Request";
             break;
         case 404:
-            header->resp_human = "Not Found";
+            resp_human = "Not Found";
             break;
         case 500:
-            header->resp_human = "Internal Server Error: cannot allocate memory";
+            resp_human = "Internal Server Error: cannot allocate memory";
             break;
         case 501:
-            header->resp_human = "Not Implemented";
+            resp_human = "Not Implemented";
             break;
         default:
             cout<<"Error assigning human-readable error code in pack_header"<<endl;
-            header->resp_human = "undefined error";
+            resp_human = "undefined error";
     }
-    header->resp_human = "OK";
-    header->version = "HTTP/1.0";
+    all = version + " " + errCode + " " + resp_human + "\r\n";
+    return all;
 }
 
-int parse_request(const char* client_req, string* uri, int* errCode, bool* invalidMethod, bool*invalidVersion) {
+int check_line_one(const char* client_req, string* uri, int* errCode, bool* invalidMethod, bool*invalidVersion) {
     char* charURI = new char[200];
     char* charMeth = new char[200];
     char* charVer = new char[200];
@@ -238,8 +140,8 @@ int parse_request(const char* client_req, string* uri, int* errCode, bool* inval
         *invalidMethod = true;
         *errCode = 400;
         return -1;
-    } else if(strUri.find(' ') != string::npos || strUri[0] != '/'){
-        cout<<"Invalid URI"<<endl;
+    } else if(strUri.find(' ') != string::npos && strUri[0] != '/'){ //TODO: is the check for / really necessary?
+        cout<<"Invalid URI, uri = \""<<strUri<<"\""<<endl;
         *errCode = 404;
         return -1;
     } else if(strVer.find("HTTP/") == string::npos) {
@@ -256,145 +158,72 @@ int parse_request(const char* client_req, string* uri, int* errCode, bool* inval
     return 0;
 }
 
-int throwError(int client_fd, Header* header, int* errCode, bool* invalidMethod, bool* invalidVersion){
-    cout<<"Inside throw error, errCode is "<<errCode<<endl;
-    string msg;
-    //set msg length
-    switch(*errCode){
-    case 200:
-        return 0;
-    case 400:
-        if(*invalidMethod) msg = "<html><body>400 Bad Request Reason: Invalid Method :<<request method>></body></html>";
-        else if(*invalidVersion) msg = "<html><body>400 Bad Request Reason: Invalid HTTPVersion: <<req version>></body></html>";
-        break;
-    case 404:
-        msg = "<html><body>404 Not Found Reason URL does not exist :<<requested url>></body></html>";
-        break;
-    case 500:
-        msg = "";
-        break;
-    case 501:
-        msg = "<html><body>501 Not Implemented <<error type>>: <<requested data>></body></html>";
-        break;
-    }
-    string header_str = header->version + " " + header->resp_code + " " + header->resp_human + "\r\n" + header->header1 + ": "+header->val1+"\r\n"+header->header2+": "+header->val2+"\r\n"+ header->header3+": "+header->val3+"\r\n\r\n";
-    string payload = header_str + msg;
-    const char* charLoad = payload.c_str();
-    int sent = send(client_fd, charLoad, payload.length(), 0);
-    return 1;
+
+void respond(int client_fd, std::string msg) {
+  //pthread_mutex_lock(&client_sock_lock);
+  if((send(client_fd, msg.c_str(), msg.length(), 0)) < 0) {
+    //pthread_mutex_unlock(&client_sock_lock);
+    logStream = fopen(logName.c_str(), "a");
+    fprintf(logStream, "respond() failed!\n");
+    fclose(logStream);
+    perror("");
+  } else {
+    logStream = fopen(logName.c_str(), "a");
+    fprintf(logStream, "respond() succeeded\n");
+    fclose(logStream);
+    //pthread_mutex_unlock(&client_sock_lock);
+  }
 }
 
-int sendFile(int client_fd, string client_msg) {
-    FILE* response;
-    struct sockaddr_in remoteSock;
-    int fileSize = 0;
-    int n;
-    int i;
-    int is404 = 0;
-    string header_str;
-    Header* header = new Header;
-    string ext;
-    string fullPath;
-    bool foundIdx = false;
 
-    //Error flags
-    int* errCode = new int;
-    *errCode = 200;
-    bool* invalidMethod = new bool;
-    *invalidMethod = false;
-    bool invalidURI;
-    bool* invalidVersion = new bool;
-    *invalidVersion = false;
-
-    string* uri = new string;
-    parse_request(client_msg.c_str(), uri, errCode, invalidMethod, invalidVersion);
-    string filepath = *uri;
-
-    //PROBABLY ALL THE BROKEN
-    if(filepath == "/") {
-        int i = 0;
-        do {
-            fullPath = homeDir + "/"+indexes[i];
-            cout<<"FULL PATH IS: "<<fullPath<<endl;
-            response = fopen(fullPath.c_str(), "rb");
-            if(response != NULL) {
-                foundIdx = true;
-                fclose(response);
-                break;
-            }
-            i++;
-        } while (!foundIdx && i < indexes.size());
-        if(foundIdx) {
-            foundIdx = true;
-            filepath = "/"+indexes[i];
-        } else {
-            cout<<"No valid index file found"<<endl;
-            is404 = 1;
+void handle_msg(int client_fd, std::string full_msg){
+    string uri;
+    string response;
+    int errCode = 200;
+    bool invalidMethod;
+    bool invalidVersion;
+    std::istringstream msgStream(full_msg);
+    std::string line;
+    getline(msgStream, line);
+    if(check_line_one(line.c_str(), &uri, &errCode, &invalidMethod, &invalidVersion) == -1) {
+        cout<<"ERROR: request line \n\t"<<line.c_str()<<"\nis invalid. Error code "<<errCode<<endl;
+        pack_header(errCode, invalidMethod, invalidVersion);
+    } else {
+        cout<<"Valid request line!"<<endl;
+        parse_request(full_msg);
+        for(int i = 0; i < fields.size(); i++){
+            cout<<"Name: "<<fields[i].name<<" Value: "<<fields[i].value<<endl;
         }
+        //check if URI exists
+        //forward message
     }
+}
 
-    fullPath = homeDir + filepath;
-
-    /*stringstream strstream;
-    strstream.str(filepath);
-    while(getline(strstream, ext, '.'));
-    ext = "."+ext;*/
-    cout<<filepath<<endl;
-    int idx = filepath.find('.');
-    ext = filepath.substr(idx, filepath.length()-1);
-    ext = "/"+ext;
-    cout<<"ext is "<<endl;
-    pack_header(header, ext, errCode);
-
-    if(!is404) response = fopen(fullPath.c_str(), "rb");
-    if(response == NULL) {
-        perror("Open file error in sendFile");
-        printf("Full path: %s\n", fullPath.c_str());
-        cout<<"homeDir is "<<homeDir<<endl;
-        *errCode = 404;
-        header->resp_code = "404";
-        header->resp_human = "File not found";
+void catch_sigint(int s){
+    cout<<"caught signal "<<s<<", exiting"<<endl;
+    caughtSigInt = true;
+    for(int i=0; i<10; i++)  {
+        pthread_join(senderThreads[i], NULL);
+        threadsActive--;
     }
-    if(throwError(client_fd, header, errCode, invalidMethod, invalidVersion)) return 0;
-
-    if(is404) {
-        response = fopen("404.html", "rb");
-        if(response == NULL) {
-            printf("AAAAARGH THE ERROR MESSAGE HAS AN ERROR\n");
-            return -1;
-        }
-        printf("response is %p\n", response);
+    pthread_mutex_destroy(&q_lock);
+    pthread_mutex_destroy(&client_sock_lock);
+    pthread_mutex_destroy(&dir_lock);
+    close(sock_fd);
+    while(!q.empty()){
+        cout<<"Stuff left in queue?"<<endl;
+        Ele* ele = q.front();
+        q.pop();
+        delete(ele);
     }
+    cout<<"done exiting"<<endl;
+    //exit(0);
+}
 
-    fseek(response, 0, SEEK_END);
-    fileSize = ftell(response);
-    rewind(response);
-    //MinGW doesn't recognize to_string, known bug
-    ostringstream ss;
-    ss << fileSize;
-    header->val2 = ss.str();
-
-    header_str = header->version + " " + header->resp_code + " " + header->resp_human + "\r\n" + header->header1 + ": "+header->val1+"\r\n"+header->header2+": "+header->val2+"\r\n"+ header->header3+": "+header->val3+"\r\n\r\n";
-
-    char buffer[fileSize];
-    bzero(buffer, fileSize);
-    while ((n = fread(buffer, sizeof(char), fileSize, response)) > 0) {
-        string strBuf(buffer, n);
-        string payload = header_str + strBuf;
-        cout<<"header str: "<<header_str.length()<<" buffer: "<<strBuf.length()<<" payload length: "<<payload.length()<<endl;
-        const char* charLoad = payload.c_str();
-        cout<<"File opened, header_str is "<<header_str<<endl;
-        if(ext== ".gif"||ext==".png"){
-            cout<<"buffer length: "<<sizeof(buffer)<<" and n = "<<n<<endl;
-            //int i;
-            //for(i = 0; i < n; i++) printf("%c", buffer[i]);
-        }
-        int sent = send(client_fd, charLoad, payload.length(), 0);
-        bzero(buffer, sizeof(buffer));
-    }
-    if (n < 0) printf("Read error\n");
-    fclose(response);
-    return 0;
+void catch_sigpipe(int s) {
+  cout<<"Caught SIGPIPE"<<endl;
+  sleep(10);
+  exit(1);
 }
 
 void *crawlQueue(void *payload){
@@ -410,7 +239,8 @@ void *crawlQueue(void *payload){
         }
         pthread_mutex_unlock(&q_lock);
         if(success) {
-            sendFile(ele->client_fd, ele->client_msg);
+            printf("Received message %s\n", ele->client_msg.c_str());
+            handle_msg(ele->client_fd, ele->client_msg);
         } else{
             //if queue was empty wait and check again
             int sleep_time = rand()%101;
@@ -420,47 +250,58 @@ void *crawlQueue(void *payload){
     }
 }
 
-void catch_sigseg(int s){
-    //HORRIBLE HACKY CHEAT NEVER EVER DO THIS THE POINT OF SEG FAULT HANDLERS IS TO DEBUG THEM NOT HIDE THEM ALSO IF YOU GET SEG FAULTS ANYWHERE ELSE YOU'RE SCREWED
-    //printf("Segmentation fault in thread %X\n", pthread_self());
-    exit(1);
+void init(){
+    caughtSigInt = false;
+    threadsActive = 0;
+    tags[0] = "id";
+    tags[1] = "pw";
+    tags[2] = "flag";
+    tags[3] = "file";
+    tags[4] = "segment";
+    tags[5] = "msg";
 }
 
 int main(int argc, char* argv[]) {
-    struct sockaddr_in server, client;
-    struct sigaction sigIntHandler;
-    struct sigaction sigSegHandler;
+    struct sockaddr_in client;
+    struct sigaction sigIntHandler, sigPipeHandler;
     int client_fd, read_size;
     socklen_t sockaddr_len;
-    char* client_req = new char[1024];
-    char* method = new char[4];
-    char* uri = new char[1086]; //2000-2-4-8
-    char* version = new char[8];
-    bzero(client_req, 1024);
-    bzero(method, 4);
-    bzero(uri, 1086);
-    bzero(version, 8);
-    caughtSigInt = false;
-    threadsActive = 0;
+    char client_req[2000];
+    std::string locLogName = "log.txt";
+    //std::string dir(argv[2]);
+    std::string confName = "dfs.conf";
+    init();
 
+    //parse configuration
+    //parseConfig(strdup(confName.c_str()));
+
+    //Set up signal handler for SIGINT and SIGPIPE
     sigIntHandler.sa_handler = catch_sigint;
     sigemptyset(&sigIntHandler.sa_mask);
     sigIntHandler.sa_flags = 0;
-
-    sigSegHandler.sa_handler = catch_sigseg;
-    sigemptyset(&sigSegHandler.sa_mask);
-    sigSegHandler.sa_flags = 0;
-
     sigaction(SIGINT, &sigIntHandler, NULL);
-    sigaction(SIGSEGV, &sigSegHandler, NULL);
 
-    //Initialize mutexes and queue
+    sigPipeHandler.sa_handler = catch_sigpipe;
+    sigemptyset(&sigPipeHandler.sa_mask);
+    sigPipeHandler.sa_flags = 0;
+    sigaction(SIGPIPE, &sigPipeHandler, NULL);
+
+    //Initialize mutexes
     if(pthread_mutex_init(&q_lock, NULL) != 0) {
-        fprintf(stderr, "ERROR: Mutex initialization failed. \n");
+        fprintf(stderr, "ERROR: Mutex initialization failed on q_lock. \n");
+        exit(1);
+    }
+    if(pthread_mutex_init(&client_sock_lock, NULL) != 0) {
+        fprintf(stderr, "ERROR: Mutex initialization failed on client_sock_lock. \n");
+        exit(1);
+    }
+    if(pthread_mutex_init(&dir_lock, NULL) != 0) {
+        fprintf(stderr, "ERROR: Mutex initialization failed on dir_lock. \n");
         exit(1);
     }
 
-    set_home_dir();
+    //Initialize socket
+    //homeDir.assign(argv[2]);
     if((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("Socket creation error");
         return 1;
@@ -468,22 +309,22 @@ int main(int argc, char* argv[]) {
     //Allows immediate reuse of socket: credit to stack overflow
     int yes = 1;
     if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
-        perror("setsockopt");
-        exit(1);
+      perror("Setsocketopt");
+      exit(1);
     }
 
-    server.sin_family = AF_INET;
-    server.sin_port= htons(port);
-    server.sin_addr.s_addr = htonl(INADDR_ANY);
-    sockaddr_len = sizeof(server);
+    servSock.sin_family = AF_INET;
+    servSock.sin_port= htons(atoi(argv[1]));
+    servSock.sin_addr.s_addr = htonl(INADDR_ANY);
+    sockaddr_len = sizeof(servSock);
 
-    if(bind(sock_fd,(struct sockaddr *)&server , sizeof(server)) < 0) {
+    if(bind(sock_fd,(struct sockaddr *)&servSock , sizeof(servSock)) < 0) {
         perror("Bind error");
         return 1;
     }
 
     if(listen(sock_fd, 10) < 0) {
-        perror("Listen error");
+      perror("Listen error");
         return 1;
     }
 
@@ -491,22 +332,26 @@ int main(int argc, char* argv[]) {
     for(int i = 0; i < 10; i++) {
         int retVal = pthread_create(&senderThreads[i], NULL, crawlQueue, NULL);
         if(retVal) {
-            perror("Error in pthread_create");
-            exit(1);
+          logStream = fopen(logName.c_str(), "a");
+          fprintf(logStream, "pthread_create error: %s\n", strerror(errno));
+          fclose(logStream);
+          exit(1);
         } else {
-            threadsActive++;
+          threadsActive++;
         }
     }
 
     while(!caughtSigInt && threadsActive > 0) {
-        cout<<"threads active = "<<threadsActive<<endl;
+        //pthread_mutex_lock(&client_sock_lock);
         if((client_fd = accept(sock_fd, (struct sockaddr *)&client, &sockaddr_len)) < 0) {
-            perror("Accept error");
+            logStream = fopen(logName.c_str(), "a");
+            fprintf(logStream, "Accept error: %s\n", strerror(errno));
+            fclose(logStream);
             while(threadsActive > 0);
-            cout<<"threadsActive after accept error: "<<threadsActive<<endl;
+            //cout<<"threadsActive after accept error: "<<threadsActive<<endl;
             return 1;
         }
-        //if(caughtSigInt) return 0;
+        //pthread_mutex_unlock(&client_sock_lock);
         while((read_size = recv(client_fd , client_req , 2000 , 0)) > 0 ) {
             Ele* ele = new Ele;
             string msg(client_req);
@@ -516,15 +361,17 @@ int main(int argc, char* argv[]) {
             q.push(ele);
             pthread_mutex_unlock(&q_lock);
             bzero(client_req, 2000);
-            fflush(stdout);
         }
 
         if(read_size < 0) {
-            perror("Recv failed");
+            logStream = fopen(logName.c_str(), "a");
+            fprintf(logStream, "Recv error: %s\n", strerror(errno));
+            fclose(logStream);
             while(threadsActive > 0);
-            cout<<"threadsActive after accept error: "<<threadsActive<<endl;
+            //cout<<"threadsActive after accept error: "<<threadsActive<<endl;
             return 1;
         }
     }
+    cout<<"Caught sig int in main"<<endl;
     return 0;
 }

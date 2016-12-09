@@ -6,19 +6,14 @@ all: $(EXE)
 
 CFLG=-g -std=c++11
 LIBS=-pthread -lcrypto
-CLEAN=rm -f dfs dfc *.o *.a
+CLEAN=rm proxy.o; rm proxy
 
 # Compile
 .cpp.o:
 	g++ -c $(CFLG) $<  $(LIBS)
 # Link
-main: dfs.o dfc.o
-	g++ -o dfs dfs.o  $(LIBS)
-	g++ -o dfc dfc.o  $(LIBS)
-
-dfc:
-	g++ -c $(CFLG) dfc.cpp  $(LIBS)
-	g++ -o dfc dfc.o $(LIBS)
+main: proxy.o
+	g++ -o proxy proxy.o  $(LIBS)
 
 #  Clean
 clean:
