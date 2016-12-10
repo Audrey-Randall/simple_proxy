@@ -66,17 +66,88 @@ typedef struct Field{
   std::string value;
 }Field;
 
-std::vector<Field> fields;
+//Credit to Andy Sayler
+int dnslookup(const char* hostname, char* firstIPstr, int maxSize){
 
-int parse_request(string msg){
-  std::istringstream msgStream;
+    /* Local vars */
+    struct addrinfo* headresult = NULL;
+    struct addrinfo* result = NULL;
+    struct sockaddr_in* ipv4sock = NULL;
+    struct in_addr* ipv4addr = NULL;
+    char ipv4str[INET_ADDRSTRLEN];
+    char ipstr[INET6_ADDRSTRLEN];
+    int addrError = 0;
+
+    /* DEBUG: Print Hostname*/
+#ifdef UTIL_DEBUG
+    fprintf(stderr, "%s\n", hostname);
+#endif
+
+    /* Lookup Hostname */
+    addrError = getaddrinfo(hostname, NULL, NULL, &headresult);
+    if(addrError){
+	fprintf(stderr, "Error looking up Address: %s\n",
+		gai_strerror(addrError));
+	return -1;
+    }
+    /* Loop Through result Linked List */
+    for(result=headresult; result != NULL; result = result->ai_next){
+	/* Extract IP Address and Convert to String */
+	if(result->ai_addr->sa_family == AF_INET){
+	    /* IPv4 Address Handling */
+	    ipv4sock = (struct sockaddr_in*)(result->ai_addr);
+	    ipv4addr = &(ipv4sock->sin_addr);
+	    if(!inet_ntop(result->ai_family, ipv4addr,
+			  ipv4str, sizeof(ipv4str))){
+		perror("Error Converting IP to String");
+		return -1;
+	    }
+#ifdef UTIL_DEBUG
+	    fprintf(stdout, "%s\n", ipv4str);
+#endif
+	    strncpy(ipstr, ipv4str, sizeof(ipstr));
+	    ipstr[sizeof(ipstr)-1] = '\0';
+	}
+	else if(result->ai_addr->sa_family == AF_INET6){
+	    /* IPv6 Handling */
+#ifdef UTIL_DEBUG
+	    fprintf(stdout, "IPv6 Address: Not Handled\n");
+#endif
+	    strncpy(ipstr, "UNHANDELED", sizeof(ipstr));
+	    ipstr[sizeof(ipstr)-1] = '\0';
+	}
+	else{
+	    /* Unhandlded Protocol Handling */
+#ifdef UTIL_DEBUG
+	    fprintf(stdout, "Unknown Protocol: Not Handled\n");
+#endif
+	    strncpy(ipstr, "UNHANDELED", sizeof(ipstr));
+	    ipstr[sizeof(ipstr)-1] = '\0';
+	}
+	/* Save First IP Address */
+	if(result==headresult){
+	    strncpy(firstIPstr, ipstr, maxSize);
+	    firstIPstr[maxSize-1] = '\0';
+	}
+    }
+
+    /* Cleanup */
+    freeaddrinfo(headresult);
+
+    return 0;
+}
+
+int parse_request(string msg, std::vector<Field> fields){
+  std::istringstream msgStream(msg);
   std::string line;
+
 
   //Ignore first line, it's already been checked by check_line_one()
   getline(msgStream, line);
+  //std::cout<<"\tLine is "<<line<<" msg is "<<msg<<std::endl;
 
   while(getline(msgStream, line) != NULL) {
-      std::cout<<"\tLine is "<<line<<std::endl;
+      std::cout<<"\tLine is "<<line<<endl; //" msg is "<<msg<<std::endl;
       Field f;
       char* pch;
       int idx = 0;
@@ -87,11 +158,28 @@ int parse_request(string msg){
         if(!idx) {
           f.name = tokStr;
         } else {
-          f.value = tokStr;
-          fields.push_back(f);
+          //f.value = tokStr;
+          int n;
+          while((n = tokStr.find(" ")) != string::npos) {
+            tokStr.replace(n, 1, "");
+          }
+          while((n = tokStr.find("\r")) != string::npos) {
+            tokStr.replace(n, 1, "");
+          }
+          bool found = false;
+          for(int i = 0; i < fields.size(); i++) {
+            if(fields[i].name.compare(f.name) == 0) {
+                fields[i].value = fields[i].value+":"+tokStr;
+                found = true;
+            }
+          }
+          if(!found) {
+            f.value = tokStr;
+            fields.push_back(f);
+          }
         }
         idx++;
-      }while ((pch = strtok(NULL, " :"))!= NULL);
+      }while ((pch = strtok(NULL, ":"))!= NULL);
     }
   return 0;
 }
@@ -99,27 +187,36 @@ int parse_request(string msg){
 string pack_header(int errCode, bool invalidMethod, bool invalidVersion) {
     string all;
     string resp_human;
-    switch(*errCode) {
+    string version = "HTTP/1.0";
+    string msg;
+
+    switch(errCode) {
         case 200:
             resp_human = "OK";
+            msg = "<html><body>200 OK</body></html>";
             break;
         case 400:
             resp_human = "Bad Request";
+            if(invalidMethod) msg = "<html><body>400 Bad Request Reason: Invalid Method :<<request method>></body></html>";
+            else if(invalidVersion) msg = "<html><body>400 Bad Request Reason: Invalid HTTP Version: <<req version>></body></html>";
             break;
         case 404:
             resp_human = "Not Found";
+            msg = "<html><body>404 Not Found Reason URL does not exist :<<requested url>></body></html>";
             break;
         case 500:
+            msg = "";
             resp_human = "Internal Server Error: cannot allocate memory";
             break;
         case 501:
+            msg = "<html><body>501 Not Implemented <<error type>>: <<requested data>></body></html>";
             resp_human = "Not Implemented";
             break;
         default:
             cout<<"Error assigning human-readable error code in pack_header"<<endl;
             resp_human = "undefined error";
     }
-    all = version + " " + errCode + " " + resp_human + "\r\n";
+    all = version + " " + to_string(errCode) + " " + resp_human + "\r\n\r\n" + msg;
     return all;
 }
 
@@ -163,38 +260,57 @@ void respond(int client_fd, std::string msg) {
   //pthread_mutex_lock(&client_sock_lock);
   if((send(client_fd, msg.c_str(), msg.length(), 0)) < 0) {
     //pthread_mutex_unlock(&client_sock_lock);
-    logStream = fopen(logName.c_str(), "a");
-    fprintf(logStream, "respond() failed!\n");
-    fclose(logStream);
-    perror("");
+    perror("respond() failed");
   } else {
-    logStream = fopen(logName.c_str(), "a");
-    fprintf(logStream, "respond() succeeded\n");
-    fclose(logStream);
+    printf("respond succeeded\n");
     //pthread_mutex_unlock(&client_sock_lock);
   }
 }
 
+int check_path(string path, string msg){
+    char addr[INET6_ADDRSTRLEN]; //TODO: should be IPv6 or IPv4?
+    if(dnslookup(path.c_str(), addr, sizeof(addr)) < 0) {
+        return 503;
+    }
+
+}
 
 void handle_msg(int client_fd, std::string full_msg){
     string uri;
     string response;
+    string err;
     int errCode = 200;
     bool invalidMethod;
     bool invalidVersion;
+    char addr[INET6_ADDRSTRLEN]; //TODO: should be IPv6 or IPv4?
+    std::vector<Field> fields;
+
     std::istringstream msgStream(full_msg);
     std::string line;
     getline(msgStream, line);
     if(check_line_one(line.c_str(), &uri, &errCode, &invalidMethod, &invalidVersion) == -1) {
         cout<<"ERROR: request line \n\t"<<line.c_str()<<"\nis invalid. Error code "<<errCode<<endl;
-        pack_header(errCode, invalidMethod, invalidVersion);
-    } else {
+        err = pack_header(errCode, invalidMethod, invalidVersion);
+        respond(client_fd, err);
+        return;
+    } else{
         cout<<"Valid request line!"<<endl;
-        parse_request(full_msg);
-        for(int i = 0; i < fields.size(); i++){
-            cout<<"Name: "<<fields[i].name<<" Value: "<<fields[i].value<<endl;
-        }
+        parse_request(full_msg, fields);
         //check if URI exists
+        for(int i = 0; i < fields.size(); i++){
+            //cout<<"Name: "<<fields[i].name<<" Value: "<<fields[i].value<<endl;
+            if(fields[i].name.compare("Host") == 0) {
+                //cout<<"Found host"<<endl;
+                string pathStr = fields[i].value;
+                if(dnslookup(pathStr.c_str(), addr, sizeof(addr)) < 0) {
+                    cout<<"DNS error on hostname \""<<pathStr<<"\"."<<endl;
+                    err = pack_header(errCode, invalidMethod, invalidVersion);
+                    respond(client_fd, err);
+                    return;
+                }
+                cout<<"DNS succeeded"<<endl;
+            }
+        }
         //forward message
     }
 }
@@ -239,7 +355,7 @@ void *crawlQueue(void *payload){
         }
         pthread_mutex_unlock(&q_lock);
         if(success) {
-            printf("Received message %s\n", ele->client_msg.c_str());
+            //printf("Received message %s\n", ele->client_msg.c_str());
             handle_msg(ele->client_fd, ele->client_msg);
         } else{
             //if queue was empty wait and check again
