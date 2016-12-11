@@ -67,11 +67,12 @@ typedef struct Field{
 }Field;
 
 //Credit to Andy Sayler
-int dnslookup(const char* hostname, char* firstIPstr, int maxSize){
+int dnslookup(const char* hostname, char* firstIPstr, int maxSize, struct addrinfo* result){
 
     /* Local vars */
     struct addrinfo* headresult = NULL;
-    struct addrinfo* result = NULL;
+    //struct addrinfo* result = NULL;
+    result = NULL;
     struct sockaddr_in* ipv4sock = NULL;
     struct in_addr* ipv4addr = NULL;
     char ipv4str[INET_ADDRSTRLEN];
@@ -137,9 +138,10 @@ int dnslookup(const char* hostname, char* firstIPstr, int maxSize){
     return 0;
 }
 
-int parse_request(string msg, std::vector<Field> fields){
+vector<Field> parse_request(string msg){
   std::istringstream msgStream(msg);
   std::string line;
+  std::vector<Field> fields;
 
 
   //Ignore first line, it's already been checked by check_line_one()
@@ -181,7 +183,7 @@ int parse_request(string msg, std::vector<Field> fields){
         idx++;
       }while ((pch = strtok(NULL, ":"))!= NULL);
     }
-  return 0;
+  return fields;
 }
 
 string pack_header(int errCode, bool invalidMethod, bool invalidVersion) {
@@ -255,6 +257,56 @@ int check_line_one(const char* client_req, string* uri, int* errCode, bool* inva
     return 0;
 }
 
+int forward_msg(string msg, string addr, int client_fd, struct addrinfo *res){
+    cout<<"forward msg"<<endl;
+    struct sockaddr_in servSock;
+    int sock_fd;
+    socklen_t sockaddr_len;
+    char buf[32768];
+
+    if((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("Socket creation error");
+        return 1;
+    }
+    //Allows immediate reuse of socket: credit to stack overflow
+    int yes = 1;
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1) {
+      perror("Setsocketopt");
+      exit(1);
+    }
+
+    servSock.sin_family = AF_INET;
+    servSock.sin_port= htons(80); //TODO: get this from request
+    servSock.sin_addr.s_addr = inet_addr(addr.c_str());
+    //inet_pton(AF_INET, addr.c_str(), &(servSock.sin_addr));
+    sockaddr_len = sizeof(servSock);
+    int n;
+    cout<<"trying to connect"<<endl;
+    if((n = connect(sock_fd, (struct sockaddr *)&servSock, sizeof(servSock))) < 0){
+        perror("Connect error");
+    }
+    cout<<"passed connect"<<endl;
+    /*if((n = listen(sock_fd, 10)) < 0) {
+      perror("Listen error");
+        return 1;
+    }*/
+//cout<<"passed listen"<<endl;
+    if((send(sock_fd, msg.c_str(), msg.length(), 0)) < 0 ) {
+        cout<<"Send error in forward_msg"<<endl;
+    }
+    cout<<"passed send"<<endl;
+    while((n = recv(sock_fd, buf, sizeof(buf), 0)) > 0) {
+        if((send(client_fd, buf, n, 0)) < 0 ) {
+            cout<<"Send error in forward_msg"<<endl;
+        }
+        if(print) cout<<"Buffer is "<<buf<<endl;
+        if(send(client_fd, buf, n, 0) < 0) {
+            cout<<"Send error to client in forward_msg"<<endl;
+        }
+        bzero(buf, sizeof(buf));
+        cout<<"Passed second send"<<endl;
+    }
+}
 
 void respond(int client_fd, std::string msg) {
   //pthread_mutex_lock(&client_sock_lock);
@@ -265,14 +317,6 @@ void respond(int client_fd, std::string msg) {
     printf("respond succeeded\n");
     //pthread_mutex_unlock(&client_sock_lock);
   }
-}
-
-int check_path(string path, string msg){
-    char addr[INET6_ADDRSTRLEN]; //TODO: should be IPv6 or IPv4?
-    if(dnslookup(path.c_str(), addr, sizeof(addr)) < 0) {
-        return 503;
-    }
-
 }
 
 void handle_msg(int client_fd, std::string full_msg){
@@ -295,20 +339,25 @@ void handle_msg(int client_fd, std::string full_msg){
         return;
     } else{
         cout<<"Valid request line!"<<endl;
-        parse_request(full_msg, fields);
+        fields = parse_request(full_msg);
         //check if URI exists
         for(int i = 0; i < fields.size(); i++){
             //cout<<"Name: "<<fields[i].name<<" Value: "<<fields[i].value<<endl;
             if(fields[i].name.compare("Host") == 0) {
                 //cout<<"Found host"<<endl;
                 string pathStr = fields[i].value;
-                if(dnslookup(pathStr.c_str(), addr, sizeof(addr)) < 0) {
+                struct addrinfo res;
+                if(dnslookup(pathStr.c_str(), addr, sizeof(addr), &res) < 0) {
                     cout<<"DNS error on hostname \""<<pathStr<<"\"."<<endl;
                     err = pack_header(errCode, invalidMethod, invalidVersion);
                     respond(client_fd, err);
                     return;
                 }
-                cout<<"DNS succeeded"<<endl;
+                string addrStr(addr);
+                cout<<"DNS succeeded, addr = "<<addrStr<<endl;
+                forward_msg(full_msg, addrStr, client_fd, &res);
+                cout<<"Exited forward_msg in thread "<<pthread_self()<<endl;
+                //handle_response();
             }
         }
         //forward message
@@ -338,8 +387,8 @@ void catch_sigint(int s){
 
 void catch_sigpipe(int s) {
   cout<<"Caught SIGPIPE"<<endl;
-  sleep(10);
-  exit(1);
+  //sleep(10);
+  //exit(1);
 }
 
 void *crawlQueue(void *payload){
@@ -383,9 +432,9 @@ int main(int argc, char* argv[]) {
     int client_fd, read_size;
     socklen_t sockaddr_len;
     char client_req[2000];
-    std::string locLogName = "log.txt";
+    //std::string locLogName = "log.txt";
     //std::string dir(argv[2]);
-    std::string confName = "dfs.conf";
+    //std::string confName = "dfs.conf";
     init();
 
     //parse configuration
