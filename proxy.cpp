@@ -149,7 +149,7 @@ vector<Field> parse_request(string msg){
   //std::cout<<"\tLine is "<<line<<" msg is "<<msg<<std::endl;
 
   while(getline(msgStream, line) != NULL) {
-      std::cout<<"\tLine is "<<line<<endl; //" msg is "<<msg<<std::endl;
+      //std::cout<<"\tLine is "<<line<<endl; //" msg is "<<msg<<std::endl;
       Field f;
       char* pch;
       int idx = 0;
@@ -257,8 +257,7 @@ int check_line_one(const char* client_req, string* uri, int* errCode, bool* inva
     return 0;
 }
 
-int forward_msg(string msg, string addr, int client_fd, struct addrinfo *res){
-    cout<<"forward msg"<<endl;
+int forward_msg(string msg, string addr, int client_fd, struct addrinfo *res, string pathStr){
     struct sockaddr_in servSock;
     int sock_fd;
     socklen_t sockaddr_len;
@@ -274,38 +273,41 @@ int forward_msg(string msg, string addr, int client_fd, struct addrinfo *res){
       perror("Setsocketopt");
       exit(1);
     }
-
+    bzero((char*)&servSock, sizeof(servSock));
     servSock.sin_family = AF_INET;
     servSock.sin_port= htons(80); //TODO: get this from request
     servSock.sin_addr.s_addr = inet_addr(addr.c_str());
     //inet_pton(AF_INET, addr.c_str(), &(servSock.sin_addr));
     sockaddr_len = sizeof(servSock);
     int n;
-    cout<<"trying to connect"<<endl;
+    cout<<"Trying to connect to host "<<pathStr<<endl;
     if((n = connect(sock_fd, (struct sockaddr *)&servSock, sizeof(servSock))) < 0){
         perror("Connect error");
     }
-    cout<<"passed connect"<<endl;
+    //cout<<"passed connect"<<endl;
     /*if((n = listen(sock_fd, 10)) < 0) {
       perror("Listen error");
         return 1;
     }*/
 //cout<<"passed listen"<<endl;
     if((send(sock_fd, msg.c_str(), msg.length(), 0)) < 0 ) {
-        cout<<"Send error in forward_msg"<<endl;
+        perror("Send error in forward_msg");
     }
-    cout<<"passed send"<<endl;
+    //cout<<"passed send"<<endl;
     while((n = recv(sock_fd, buf, sizeof(buf), 0)) > 0) {
-        if((send(client_fd, buf, n, 0)) < 0 ) {
-            cout<<"Send error in forward_msg"<<endl;
+            int k;
+        if((k = send(client_fd, buf, n, 0)) < 0 ) {
+            perror("Send error in forward_msg");
         }
-        if(print) cout<<"Buffer is "<<buf<<endl;
-        if(send(client_fd, buf, n, 0) < 0) {
-            cout<<"Send error to client in forward_msg"<<endl;
+        //cout<<"\tNumber of bytes received: "<<n<<endl;
+        for(int i = 0; i < n; i++) {
+            //cout<<buf[i];
         }
+        cout<<"\tNumber of bytes received: "<<n<<" Number of bytes sent: "<<k<<" Host path: "<<pathStr<<endl;
         bzero(buf, sizeof(buf));
-        cout<<"Passed second send"<<endl;
+        //cout<<"Passed second send, path is "<<pathStr<<endl;
     }
+    cout<<"\n"<<endl;
 }
 
 void respond(int client_fd, std::string msg) {
@@ -337,12 +339,11 @@ void handle_msg(int client_fd, std::string full_msg){
         err = pack_header(errCode, invalidMethod, invalidVersion);
         respond(client_fd, err);
         return;
-    } else{
-        cout<<"Valid request line!"<<endl;
+    }else{
+        cout<<"Valid status line! ";
         fields = parse_request(full_msg);
-        //check if URI exists
+        /*check if URI exists*/
         for(int i = 0; i < fields.size(); i++){
-            //cout<<"Name: "<<fields[i].name<<" Value: "<<fields[i].value<<endl;
             if(fields[i].name.compare("Host") == 0) {
                 //cout<<"Found host"<<endl;
                 string pathStr = fields[i].value;
@@ -354,9 +355,9 @@ void handle_msg(int client_fd, std::string full_msg){
                     return;
                 }
                 string addrStr(addr);
-                cout<<"DNS succeeded, addr = "<<addrStr<<endl;
-                forward_msg(full_msg, addrStr, client_fd, &res);
-                cout<<"Exited forward_msg in thread "<<pthread_self()<<endl;
+                cout<<"DNS succeeded, addr = "<<addrStr<<" found for path "<<pathStr<<endl;
+                forward_msg(full_msg, addrStr, client_fd, &res, pathStr);
+                cout<<"Exited forward_msg with path "<<pathStr<<" in thread "<<pthread_self()<<endl;
                 //handle_response();
             }
         }
